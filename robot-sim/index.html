@@ -38,6 +38,13 @@
   }
   button:hover { background: #2c3546; }
   button.primary { background: var(--accent); color: #1a1205; border-color: var(--accent); font-weight: 600; }
+  #goalActions { display: none; margin-top: 10px; padding: 10px; border: 1px dashed #3d6b50; border-radius: 8px; background: #16211b; }
+  #goalActions.show { display: block; }
+  #goalActions p { margin: 0 0 8px; color: #b9d8c4; font-size: 12px; }
+  #goalActions .row { margin-top: 0; }
+  button.active { background: #2f5c42; border-color: #5cff9d; }
+  button:disabled { opacity: .45; cursor: default; }
+  body.placing #view, body.placing #minimap { cursor: crosshair; }
   label.ctl { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; }
   input[type=range] { flex: 1; }
   .legend { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 8px; font-size: 12px; }
@@ -51,7 +58,7 @@
 <div id="view"></div>
 <div id="panel">
   <h1>Robot Mapping Simulation</h1>
-  <div class="sub">The robot knows a goal exists somewhere in the building, but not where. It explores frontiers of its own map, built from what its 4&nbsp;m × 65° vision cone sees, until it spots the goal — then navigates to it.</div>
+  <div class="sub">The robot knows a goal exists somewhere in the building, but not where. It explores frontiers of its own map, built from what its 4&nbsp;m × 65° vision cone sees, until it spots the goal — then navigates to it. Afterwards you can place new goals; it reuses and extends its map.</div>
   <div id="status">Ready</div>
   <div class="stats">
     <div><span>Sim time</span><b id="sTime">0.0 s</b></div>
@@ -60,7 +67,8 @@
     <div><span>Walls seen</span><b id="sWalls">0</b></div>
     <div><span>Replans</span><b id="sReplans">0</b></div>
     <div><span>Distance to goal</span><b id="sGoal">–</b></div>
-    <div><span>Goal spotted at</span><b id="sFound">–</b></div>
+    <div><span>Goal known at</span><b id="sFound">–</b></div>
+    <div><span>Goals reached</span><b id="sReached">0</b></div>
   </div>
   <div class="label">Robot's internal map</div>
   <canvas id="minimap"></canvas>
@@ -71,6 +79,13 @@
     <div><i style="background:#4cc3ff"></i>Planned path</div>
     <div><i style="background:#e07bff"></i>Exploration target</div>
     <div><i style="background:#5cff9d"></i>Goal (once seen)</div>
+  </div>
+  <div id="goalActions">
+    <p>Goal reached. Place a new goal by clicking the floor or the map. The robot keeps everything it has mapped so far and keeps mapping on the way.</p>
+    <div class="row">
+      <button id="btnPlace">Place new goal</button>
+      <button id="btnContinue" class="primary" disabled>Continue to new goal</button>
+    </div>
   </div>
   <div class="row">
     <button id="btnRun" class="primary">Start</button>
@@ -233,7 +248,7 @@ function generateBuilding(seed) {
     for (let y = Math.max(0, R.y0); y < Math.min(H, R.y1); y++)
       for (let x = Math.max(0, R.x0); x < Math.min(W, R.x1); x++) truth[y * W + x] = 1;
 
-  return { truth, rects, start: centre(startRoom), goal: centre(goalRoom) };
+  return { truth, rects, start: centre(startRoom), goal: centre(goalRoom), goal0: centre(goalRoom) };
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +485,9 @@ let seed = (Math.random() * 1e9) | 0;
 let world, map, robot, path, trail, running, finished, simTime, replans, sinceReplan, needReplan, scanLeft;
 // Search state: the robot knows a goal exists but not where it is.
 let goalKnown, goalSpottedAt, target, blacklist, framesSinceStatus;
+// Multi-goal state: after reaching a goal the user can place another one.
+let goalsReached = 0, legStart = 0, placing = false, pendingGoal = null;
+const PLACE_CLEARANCE = 4; // cells of free space required around a user-placed goal
 const GOAL_SPOT_R = 3;     // cells: rays passing this close to the goal reveal it
 const MIN_FRONTIER = 8;    // cells: ignore frontiers right under the robot
 
@@ -490,7 +508,10 @@ function resetSim(newBuilding) {
   map = new RobotMap();
   const startHeading = mulberry32(seed ^ 0x5bd1e995)() * Math.PI * 2;
   robot = { x: world.start.x, y: world.start.y, h: startHeading, dist: 0 };
+  world.goal = { ...world.goal0 };
   goalKnown = false; goalSpottedAt = null; target = -1; blacklist = new Uint8Array(W * H);
+  goalsReached = 0; legStart = 0; pendingGoal = null;
+  setPlacing(false); showGoalActions(false);
   setGoalVisual();
   path = null; trail = [{ x: robot.x, y: robot.y }];
   running = false; finished = false; simTime = 0; replans = 0; sinceReplan = 0; needReplan = true;
@@ -605,7 +626,7 @@ function step(dt) {
   if (!path) {
     finished = true; running = false;
     setStatus(goalKnown ? 'No route found to goal' : 'Explored everything reachable — goal not found', 'fail');
-    $('btnRun').textContent = 'Start';
+    $('btnRun').textContent = 'Restart';
     return;
   }
 
@@ -637,9 +658,13 @@ function step(dt) {
 
   if (Math.hypot(world.goal.x - robot.x, world.goal.y - robot.y) < GOAL_TOL) {
     finished = true; running = false; path = [];
+    goalsReached++;
     setLine(pathLine, []);
-    setStatus(`Goal reached in ${simTime.toFixed(1)} s ✔`, 'done');
-    document.getElementById('btnRun').textContent = 'Start';
+    setStatus(goalsReached === 1
+      ? `Goal reached in ${simTime.toFixed(1)} s ✔`
+      : `Goal ${goalsReached} reached — leg took ${(simTime - legStart).toFixed(1)} s ✔`, 'done');
+    $('btnRun').textContent = 'Restart';
+    showGoalActions(true);
   }
 }
 
@@ -700,6 +725,12 @@ function drawMinimap() {
     mctx.strokeStyle = '#5cff9d'; mctx.lineWidth = 2;
     mctx.beginPath(); mctx.arc(world.goal.x * MS, world.goal.y * MS, 5, 0, Math.PI * 2); mctx.stroke();
   }
+  // placement preview
+  if (placeMarker.visible) {
+    const px = (placeMarker.position.x - OX) / CELL * MS, py = (placeMarker.position.z - OZ) / CELL * MS;
+    mctx.strokeStyle = '#' + placeMarker.material.color.getHexString(); mctx.lineWidth = 2; mctx.setLineDash([3, 2]);
+    mctx.beginPath(); mctx.arc(px, py, 5, 0, Math.PI * 2); mctx.stroke(); mctx.setLineDash([]);
+  }
   // robot
   mctx.fillStyle = '#ffb347';
   mctx.beginPath(); mctx.arc(robot.x * MS, robot.y * MS, ROBOT_R * MS, 0, Math.PI * 2); mctx.fill();
@@ -709,7 +740,10 @@ function drawMinimap() {
 }
 
 const $ = (id) => document.getElementById(id);
-function statusText() { return goalKnown ? 'Goal spotted — navigating to it…' : 'Searching for the goal (exploring frontiers)…'; }
+function statusText() {
+  if (!goalKnown) return 'Searching for the goal (exploring frontiers)…';
+  return goalsReached ? `Heading to goal ${goalsReached + 1} using its map so far…` : 'Goal spotted — navigating to it…';
+}
 function setStatus(text, cls = '') { const s = $('status'); s.textContent = text; s.className = cls; }
 function updateStats() {
   $('sTime').textContent = simTime.toFixed(1) + ' s';
@@ -721,6 +755,7 @@ function updateStats() {
     ? (Math.hypot(world.goal.x - robot.x, world.goal.y - robot.y) * CELL).toFixed(1) + ' m'
     : 'not found yet';
   $('sFound').textContent = goalSpottedAt === null ? '–' : goalSpottedAt.toFixed(1) + ' s';
+  $('sReached').textContent = goalsReached;
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +779,82 @@ $('wallMode').onchange = (e) => {
     mat.opacity = m === 'solid' ? 1 : 0.22; mat.transparent = m !== 'solid'; mat.depthWrite = m === 'solid'; mat.needsUpdate = true;
   }
 };
+
+// --- Placing a new goal after the current one is reached -------------------
+const placeMarker = new THREE.Mesh(new THREE.TorusGeometry(0.35, 0.05, 12, 48),
+  new THREE.MeshBasicMaterial({ color: 0x5cff9d, transparent: true, opacity: 0.6 }));
+placeMarker.rotation.x = Math.PI / 2; placeMarker.position.y = 0.07; placeMarker.visible = false;
+scene.add(placeMarker);
+
+function showGoalActions(show) {
+  $('goalActions').classList.toggle('show', show);
+  $('btnContinue').disabled = !pendingGoal;
+}
+function setPlacing(on) {
+  placing = on;
+  document.body.classList.toggle('placing', on);
+  $('btnPlace').classList.toggle('active', on);
+  $('btnPlace').textContent = on ? 'Click floor or map…' : (pendingGoal ? 'Move goal' : 'Place new goal');
+  if (!on) placeMarker.visible = false;
+}
+// Placement is validated against the real building (the user can see it), not the robot's map:
+// the goal may sit in territory the robot has never seen.
+function placementOk(x, y) {
+  const cx = Math.floor(x), cy = Math.floor(y), r = PLACE_CLEARANCE;
+  if (cx < r || cy < r || cx >= W - r || cy >= H - r) return false;
+  for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++)
+    if (world.truth[(cy + dy) * W + cx + dx]) return false;
+  return Math.hypot(x - robot.x, y - robot.y) > GOAL_TOL + 3;
+}
+function tryPlace(x, y) {
+  if (!placementOk(x, y)) { setStatus('Can’t place a goal there — pick open floor away from walls and the robot', 'fail'); return; }
+  pendingGoal = { x: Math.floor(x) + 0.5, y: Math.floor(y) + 0.5 };
+  world.goal = { ...pendingGoal };
+  goalGroup.position.set(wx(pendingGoal.x), 0, wz(pendingGoal.y));
+  goalKnown = true; setGoalVisual();
+  setPlacing(false); showGoalActions(true);
+  setStatus('New goal placed — press “Continue to new goal”', 'done');
+}
+function continueToGoal() {
+  if (!pendingGoal) return;
+  pendingGoal = null;
+  goalKnown = true; goalSpottedAt = simTime; legStart = simTime;
+  target = -1; path = null; needReplan = true; finished = false; running = true;
+  showGoalActions(false); setPlacing(false);
+  $('btnRun').textContent = 'Pause';
+  setStatus(statusText());
+}
+
+// Pointer → cell coordinates on the floor
+const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2();
+function floorCellFromEvent(e) {
+  const r = renderer.domElement.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const hit = raycaster.intersectObject(floor)[0];
+  return hit ? { x: (hit.point.x - OX) / CELL, y: (hit.point.z - OZ) / CELL } : null;
+}
+function previewAt(c) {
+  if (!placing || !c) { placeMarker.visible = false; return; }
+  placeMarker.visible = true;
+  placeMarker.position.set(wx(c.x), 0.07, wz(c.y));
+  placeMarker.material.color.set(placementOk(c.x, c.y) ? 0x5cff9d : 0xff5c5c);
+}
+let downAt = null;
+renderer.domElement.addEventListener('pointerdown', (e) => { downAt = { x: e.clientX, y: e.clientY }; });
+renderer.domElement.addEventListener('pointermove', (e) => { if (placing) previewAt(floorCellFromEvent(e)); });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  // Treat as a click only if the pointer barely moved (otherwise it was an orbit drag)
+  if (!placing || !downAt || Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 5) return;
+  const c = floorCellFromEvent(e); if (c) tryPlace(c.x, c.y);
+});
+const miniCell = (e) => { const r = mini.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H }; };
+mini.addEventListener('pointermove', (e) => { if (placing) previewAt(miniCell(e)); });
+mini.addEventListener('click', (e) => { if (placing) { const c = miniCell(e); tryPlace(c.x, c.y); } });
+$('btnPlace').onclick = () => setPlacing(!placing);
+$('btnContinue').onclick = continueToGoal;
+addEventListener('keydown', (e) => { if (e.key === 'Escape' && placing) setPlacing(false); });
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
@@ -783,7 +894,8 @@ requestAnimationFrame(frame);
 // Expose for debugging / headless testing
 window.__sim = { get robot() { return robot; }, get finished() { return finished; }, get map() { return map; }, get world() { return world; }, get goalKnown() { return goalKnown; }, get simTime() { return simTime; },
   run(seconds) { running = true; const n = Math.round(seconds / FIXED); for (let i = 0; i < n && !finished; i++) step(FIXED); running = !finished; return finished; },
-  newBuilding(s) { seed = s; resetSim(true); } };
+  newBuilding(s) { seed = s; resetSim(true); },
+  placeGoal(x, y) { tryPlace(x, y); return !!pendingGoal; }, continueToGoal, get goalsReached() { return goalsReached; } };
 </script>
 </body>
 </html>
