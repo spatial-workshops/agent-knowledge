@@ -51,7 +51,7 @@
 <div id="view"></div>
 <div id="panel">
   <h1>Robot Mapping Simulation</h1>
-  <div class="sub">The robot knows only its goal's coordinates. It builds its own map from what its 4&nbsp;m × 65° vision cone sees, and replans as it discovers walls.</div>
+  <div class="sub">The robot knows a goal exists somewhere in the building, but not where. It explores frontiers of its own map, built from what its 4&nbsp;m × 65° vision cone sees, until it spots the goal — then navigates to it.</div>
   <div id="status">Ready</div>
   <div class="stats">
     <div><span>Sim time</span><b id="sTime">0.0 s</b></div>
@@ -60,6 +60,7 @@
     <div><span>Walls seen</span><b id="sWalls">0</b></div>
     <div><span>Replans</span><b id="sReplans">0</b></div>
     <div><span>Distance to goal</span><b id="sGoal">–</b></div>
+    <div><span>Goal spotted at</span><b id="sFound">–</b></div>
   </div>
   <div class="label">Robot's internal map</div>
   <canvas id="minimap"></canvas>
@@ -68,6 +69,8 @@
     <div><i style="background:#cfd9e6"></i>Seen free</div>
     <div><i style="background:#ff7a3d"></i>Seen wall</div>
     <div><i style="background:#4cc3ff"></i>Planned path</div>
+    <div><i style="background:#e07bff"></i>Exploration target</div>
+    <div><i style="background:#5cff9d"></i>Goal (once seen)</div>
   </div>
   <div class="row">
     <button id="btnRun" class="primary">Start</button>
@@ -293,10 +296,13 @@ class Heap {
 const gScore = new Float32Array(W * H);
 const came = new Int32Array(W * H);
 const closed = new Uint8Array(W * H);
-function planPath(map, sx, sy, gx, gy) {
+// If isGoal is given, the search becomes Dijkstra (no heuristic) and stops at
+// the cheapest cell satisfying isGoal — used to find the nearest frontier.
+function planPath(map, sx, sy, gx, gy, isGoal) {
   gScore.fill(Infinity); came.fill(-1); closed.fill(0);
-  const s = sy * W + sx, g = gy * W + gx;
-  const h = (x, y) => { const dx = Math.abs(x - gx), dy = Math.abs(y - gy);
+  const s = sy * W + sx;
+  let g = isGoal ? -1 : gy * W + gx;
+  const h = isGoal ? () => 0 : (x, y) => { const dx = Math.abs(x - gx), dy = Math.abs(y - gy);
     return (dx + dy) + (Math.SQRT2 - 2) * Math.min(dx, dy); };
   const open = new Heap();
   gScore[s] = 0; open.push(s, h(sx, sy));
@@ -312,6 +318,7 @@ function planPath(map, sx, sy, gx, gy) {
     const cur = open.pop();
     if (closed[cur]) continue;
     if (cur === g) break;
+    if (isGoal && isGoal(cur)) { g = cur; break; }
     closed[cur] = 1;
     const cx = cur % W, cy = (cur / W) | 0;
     for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
@@ -327,7 +334,7 @@ function planPath(map, sx, sy, gx, gy) {
       if (ng < gScore[j]) { gScore[j] = ng; came[j] = cur; open.push(j, ng + h(x, y)); }
     }
   }
-  if (came[g] === -1 && g !== s) return null;
+  if (g === -1 || (came[g] === -1 && g !== s)) return null;
   const path = [];
   for (let c = g; c !== -1; c = came[c]) path.push({ x: c % W + 0.5, y: ((c / W) | 0) + 0.5 });
   path.reverse();
@@ -461,6 +468,10 @@ function setLine(line, pts) {
 // ---------------------------------------------------------------------------
 let seed = (Math.random() * 1e9) | 0;
 let world, map, robot, path, trail, running, finished, simTime, replans, sinceReplan, needReplan, scanLeft;
+// Search state: the robot knows a goal exists but not where it is.
+let goalKnown, goalSpottedAt, target, blacklist, framesSinceStatus;
+const GOAL_SPOT_R = 3;     // cells: rays passing this close to the goal reveal it
+const MIN_FRONTIER = 8;    // cells: ignore frontiers right under the robot
 
 function buildWorldMeshes() {
   for (const c of [...worldGroup.children]) { c.geometry.dispose(); worldGroup.remove(c); }
@@ -477,8 +488,10 @@ function buildWorldMeshes() {
 function resetSim(newBuilding) {
   if (newBuilding || !world) { world = generateBuilding(seed); buildWorldMeshes(); }
   map = new RobotMap();
-  const startHeading = Math.atan2(world.goal.y - world.start.y, world.goal.x - world.start.x);
+  const startHeading = mulberry32(seed ^ 0x5bd1e995)() * Math.PI * 2;
   robot = { x: world.start.x, y: world.start.y, h: startHeading, dist: 0 };
+  goalKnown = false; goalSpottedAt = null; target = -1; blacklist = new Uint8Array(W * H);
+  setGoalVisual();
   path = null; trail = [{ x: robot.x, y: robot.y }];
   running = false; finished = false; simTime = 0; replans = 0; sinceReplan = 0; needReplan = true;
   scanLeft = Math.PI * 2; // initial look-around
@@ -510,6 +523,11 @@ function sense() {
       const i = y * W + x;
       if (world.truth[i]) { if (map.markWall(i)) newWalls++; break; }
       map.markFree(i);
+      if (!goalKnown && (robot.x + dx * t - world.goal.x) ** 2 + (robot.y + dy * t - world.goal.y) ** 2 < GOAL_SPOT_R ** 2) {
+        goalKnown = true; goalSpottedAt = simTime; needReplan = true; target = -1;
+        setGoalVisual();
+        setStatus('Goal spotted! Navigating to it…');
+      }
     }
   }
   if (newWalls && path && pathBlocked()) needReplan = true;
@@ -527,11 +545,33 @@ function pathBlocked() {
   return false;
 }
 
+// A frontier is a seen-free cell bordering unknown space, with room for the robot.
+function isFrontier(j) {
+  if (map.cells[j] !== FREE || map.inflated[j] || blacklist[j]) return false;
+  const x = j % W, y = (j / W) | 0;
+  return (x > 0 && map.cells[j - 1] === UNKNOWN) || (x < W - 1 && map.cells[j + 1] === UNKNOWN) ||
+         (y > 0 && map.cells[j - W] === UNKNOWN) || (y < H - 1 && map.cells[j + W] === UNKNOWN);
+}
+
 function replan() {
   const sx = Math.floor(robot.x), sy = Math.floor(robot.y);
-  path = planPath(map, sx, sy, Math.floor(world.goal.x), Math.floor(world.goal.y));
   replans++; sinceReplan = 0; needReplan = false;
-  if (path) path[path.length - 1] = { x: world.goal.x, y: world.goal.y };
+  if (goalKnown) {
+    path = planPath(map, sx, sy, Math.floor(world.goal.x), Math.floor(world.goal.y));
+    if (path) path[path.length - 1] = { x: world.goal.x, y: world.goal.y };
+  } else {
+    // Keep the current exploration target while it is still a frontier (avoids dithering),
+    // otherwise pick the nearest reachable frontier on the robot's own map.
+    path = null;
+    if (target !== -1 && isFrontier(target)) path = planPath(map, sx, sy, target % W, (target / W) | 0);
+    if (!path) {
+      const far = (j) => (j % W - sx) ** 2 + (((j / W) | 0) - sy) ** 2 >= MIN_FRONTIER ** 2;
+      path = planPath(map, sx, sy, 0, 0, (j) => far(j) && isFrontier(j)) ||
+             planPath(map, sx, sy, 0, 0, isFrontier);
+      if (path) { const e = path[path.length - 1]; target = Math.floor(e.y) * W + Math.floor(e.x); }
+      else target = -1;
+    }
+  }
   setLine(pathLine, path || []);
 }
 
@@ -550,8 +590,24 @@ function step(dt) {
     return;
   }
 
+  if (!goalKnown && target !== -1) {
+    // Reached (or nearly reached) the exploration target, or it's been seen: move on.
+    const tx = target % W + 0.5, ty = ((target / W) | 0) + 0.5;
+    if (Math.hypot(tx - robot.x, ty - robot.y) < 4) {
+      for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) {
+        const x = Math.floor(tx) + dx, y = Math.floor(ty) + dy;
+        if (x >= 0 && y >= 0 && x < W && y < H) blacklist[y * W + x] = 1;
+      }
+      needReplan = true;
+    } else if (!isFrontier(target)) needReplan = true;
+  }
   if (needReplan || !path || sinceReplan > 1.5) replan();
-  if (!path) { finished = true; running = false; setStatus('No route found to goal', 'fail'); return; }
+  if (!path) {
+    finished = true; running = false;
+    setStatus(goalKnown ? 'No route found to goal' : 'Explored everything reachable — goal not found', 'fail');
+    $('btnRun').textContent = 'Start';
+    return;
+  }
 
   // Pure pursuit: aim at a point ~0.7 m along the path from the nearest point
   let best = 0, bd = Infinity;
@@ -590,6 +646,14 @@ function step(dt) {
 // ---------------------------------------------------------------------------
 // Rendering helpers
 // ---------------------------------------------------------------------------
+function setGoalVisual() {
+  // Before it is spotted the goal is drawn as faint "ground truth" (like the ghost walls)
+  ring.material.color.set(goalKnown ? 0x5cff9d : 0x5c7a68);
+  ring.material.transparent = beacon.material.transparent = true;
+  ring.material.opacity = goalKnown ? 1 : 0.35;
+  beacon.material.opacity = goalKnown ? 0.7 : 0.12;
+}
+
 function updateRobotMesh() {
   robotGroup.position.set(wx(robot.x), 0, wz(robot.y));
   robotGroup.rotation.y = -robot.h;
@@ -625,9 +689,17 @@ function drawMinimap() {
     mctx.beginPath(); path.forEach((p, i) => i ? mctx.lineTo(p.x * MS, p.y * MS) : mctx.moveTo(p.x * MS, p.y * MS));
     mctx.stroke(); mctx.setLineDash([]);
   }
-  // goal
-  mctx.strokeStyle = '#5cff9d'; mctx.lineWidth = 2;
-  mctx.beginPath(); mctx.arc(world.goal.x * MS, world.goal.y * MS, 5, 0, Math.PI * 2); mctx.stroke();
+  // exploration target
+  if (!goalKnown && target !== -1) {
+    const tx = (target % W + 0.5) * MS, ty = (((target / W) | 0) + 0.5) * MS;
+    mctx.strokeStyle = '#e07bff'; mctx.lineWidth = 2;
+    mctx.beginPath(); mctx.moveTo(tx - 4, ty - 4); mctx.lineTo(tx + 4, ty + 4); mctx.moveTo(tx + 4, ty - 4); mctx.lineTo(tx - 4, ty + 4); mctx.stroke();
+  }
+  // goal (only once the robot has seen it — this is the robot's map)
+  if (goalKnown) {
+    mctx.strokeStyle = '#5cff9d'; mctx.lineWidth = 2;
+    mctx.beginPath(); mctx.arc(world.goal.x * MS, world.goal.y * MS, 5, 0, Math.PI * 2); mctx.stroke();
+  }
   // robot
   mctx.fillStyle = '#ffb347';
   mctx.beginPath(); mctx.arc(robot.x * MS, robot.y * MS, ROBOT_R * MS, 0, Math.PI * 2); mctx.fill();
@@ -637,6 +709,7 @@ function drawMinimap() {
 }
 
 const $ = (id) => document.getElementById(id);
+function statusText() { return goalKnown ? 'Goal spotted — navigating to it…' : 'Searching for the goal (exploring frontiers)…'; }
 function setStatus(text, cls = '') { const s = $('status'); s.textContent = text; s.className = cls; }
 function updateStats() {
   $('sTime').textContent = simTime.toFixed(1) + ' s';
@@ -644,7 +717,10 @@ function updateStats() {
   $('sMapped').textContent = (100 * map.knownCount / (W * H)).toFixed(1) + '%';
   $('sWalls').textContent = map.wallCount;
   $('sReplans').textContent = replans;
-  $('sGoal').textContent = (Math.hypot(world.goal.x - robot.x, world.goal.y - robot.y) * CELL).toFixed(1) + ' m';
+  $('sGoal').textContent = goalKnown
+    ? (Math.hypot(world.goal.x - robot.x, world.goal.y - robot.y) * CELL).toFixed(1) + ' m'
+    : 'not found yet';
+  $('sFound').textContent = goalSpottedAt === null ? '–' : goalSpottedAt.toFixed(1) + ' s';
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +731,7 @@ $('btnRun').onclick = () => {
   if (finished) resetSim(false);
   running = !running;
   $('btnRun').textContent = running ? 'Pause' : 'Resume';
-  if (running) setStatus(scanLeft > 0 ? 'Scanning surroundings…' : 'Exploring toward goal…');
+  if (running) setStatus(scanLeft > 0 ? 'Scanning surroundings…' : statusText());
   else setStatus('Paused');
 };
 $('btnReset').onclick = () => resetSim(false);
@@ -685,7 +761,7 @@ function frame(now) {
   if (running && !finished) {
     const steps = Math.round(elapsed / FIXED * speedMul);
     for (let i = 0; i < steps && running && !finished; i++) step(FIXED);
-    if (running && !finished && scanLeft <= 0) setStatus('Exploring toward goal…');
+    if (running && !finished && scanLeft <= 0) setStatus(statusText());
     setLine(trailLine, [...trail, { x: robot.x, y: robot.y }]);
     if (path) setLine(pathLine, path);
   }
@@ -705,7 +781,7 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // Expose for debugging / headless testing
-window.__sim = { get robot() { return robot; }, get finished() { return finished; }, get map() { return map; }, get world() { return world; },
+window.__sim = { get robot() { return robot; }, get finished() { return finished; }, get map() { return map; }, get world() { return world; }, get goalKnown() { return goalKnown; }, get simTime() { return simTime; },
   run(seconds) { running = true; const n = Math.round(seconds / FIXED); for (let i = 0; i < n && !finished; i++) step(FIXED); running = !finished; return finished; },
   newBuilding(s) { seed = s; resetSim(true); } };
 </script>
